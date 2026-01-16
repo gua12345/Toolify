@@ -51,7 +51,8 @@ class UpstreamService(BaseModel):
 class ClientAuthConfig(BaseModel):
     """Client authentication configuration"""
     allowed_keys: List[str] = Field(description="List of allowed client API keys")
-    
+    dynamic_routing_keys: List[str] = Field(default_factory=list, description="List of allowed path keys for dynamic routing (short keys for URL usage)")
+
     @field_validator('allowed_keys')
     def validate_allowed_keys(cls, v):
         if not v or len(v) == 0:
@@ -59,6 +60,15 @@ class ClientAuthConfig(BaseModel):
         for key in v:
             if not key or key.strip() == "":
                 raise ValueError('API key cannot be empty')
+        return v
+
+    @field_validator('dynamic_routing_keys')
+    def validate_dynamic_routing_keys(cls, v):
+        # 允许为空列表（当动态路由未启用时）
+        if v:
+            for key in v:
+                if not key or key.strip() == "":
+                    raise ValueError('Dynamic routing key cannot be empty')
         return v
 
 
@@ -70,7 +80,10 @@ class FeaturesConfig(BaseModel):
     prompt_template: Optional[str] = Field(default=None, description="Custom prompt template for function calling")
     key_passthrough: bool = Field(default=False, description="If true, directly forward client-provided API key to upstream instead of using configured upstream key")
     model_passthrough: bool = Field(default=False, description="If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing")
-    
+
+    # Dynamic routing configuration
+    enable_dynamic_routing: bool = Field(default=False, description="If true, enable dynamic base_url routing via URL path: /{path_key}/{protocol}/{base_url}/{remaining_path}")
+
     # Function calling error retry configuration
     enable_fc_error_retry: bool = Field(default=False, description="Enable automatic retry when function call parsing fails")
     fc_error_retry_max_attempts: int = Field(default=3, ge=1, le=10, description="Maximum number of retry attempts for function call error correction")
@@ -241,6 +254,10 @@ class ConfigLoader:
     def get_allowed_client_keys(self) -> Set[str]:
         """Get set of allowed client keys"""
         return set(self.config.client_authentication.allowed_keys)
+
+    def get_dynamic_routing_keys(self) -> Set[str]:
+        """Get set of allowed dynamic routing path keys"""
+        return set(self.config.client_authentication.dynamic_routing_keys)
     
     def get_log_level(self) -> str:
         """Get configured log level"""

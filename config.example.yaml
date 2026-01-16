@@ -37,9 +37,18 @@ upstream_services:
 
 # Client authentication configuration
 client_authentication:
+  # API keys for standard /v1/chat/completions endpoint
   allowed_keys:
     - "sk-my-secret-key-1"
     - "sk-my-secret-key-2"
+
+  # Path keys for dynamic routing (short, easy-to-remember keys for URL usage)
+  # Used in URL format: /{path_key}/{protocol}/{base_url}/{remaining_path}
+  # Example: /mykey/https/api.openai.com/v1/chat/completions
+  dynamic_routing_keys:
+    - "mykey"
+    - "proxy"
+    - "route1"
 
 # Feature configuration
 features:
@@ -48,7 +57,8 @@ features:
   convert_developer_to_system: true  # Whether to convert the developer role to the system role
   key_passthrough: false          # If true, directly forward client-provided API key to upstream instead of using configured upstream key
   model_passthrough: false         # If true, forward all requests directly to the 'openai' upstream service, ignoring model-based routing
-  
+  enable_dynamic_routing: false    # If true, enable dynamic base_url routing via URL path: /{path_key}/{protocol}/{base_url_encoded}/{remaining_path}
+
   # Custom prompt template (optional). If not provided, the default prompt will be used.
   # The default prompt includes comprehensive features:
   # - Support for multiple tool calls in a single response
@@ -96,7 +106,8 @@ features:
 #    - There must be one and only one service marked as is_default: true
 #
 # 3. Client authentication:
-#    - allowed_keys: List of client API keys allowed to access this middleware
+#    - allowed_keys: List of client API keys allowed to access this middleware (for standard endpoints)
+#    - dynamic_routing_keys: List of short path keys for dynamic routing (separate from API keys for better security and usability)
 #
 # 4. Logging levels:
 #    - DEBUG: Show all debug information (most verbose)
@@ -110,3 +121,14 @@ features:
 #    - Please keep API keys safe and do not commit configuration files containing real keys to version control systems
 #    - It is recommended to use different configuration files for different environments
 #    - Environment variables can be used to manage sensitive information
+# 6. Dynamic routing feature:
+#    - When enable_dynamic_routing is set to true, you can specify the upstream base_url dynamically via URL path
+#    - URL format: http://your-service/{path_key}/{protocol}/{base_url}/{remaining_path}
+#    - Example: http://localhost:8000/mykey/https/api.openai.com/v1/chat/completions
+#    - path_key: One of the dynamic_routing_keys from client_authentication (short, easy-to-remember)
+#    - protocol: Either "http" or "https"
+#    - base_url: The target upstream base URL (e.g., api.openai.com/v1 or ip:port)
+#    - remaining_path: The API endpoint path (e.g., /chat/completions)
+#    - In dynamic routing mode, all request headers (including Authorization), query parameters, and body are forwarded directly to the upstream service
+#    - This feature allows you to proxy requests to any upstream service without pre-configuring it
+#    - Security note: dynamic_routing_keys are separate from allowed_keys for better security isolation

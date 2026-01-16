@@ -16,7 +16,7 @@ import random
 import logging
 import tiktoken
 import xml.etree.ElementTree as ET
-from typing import List, Dict, Any, Optional, Literal, Union
+from typing import List, Dict, Any, Optional, Literal, Union, Tuple
 
 from fastapi import FastAPI, Request, Header, HTTPException, Depends
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -175,16 +175,19 @@ try:
     logger.info(f"✅ Configuration loaded successfully: {config_loader.config_path}")
     logger.info(f"📊 Configured {len(app_config.upstream_services)} upstream services")
     logger.info(f"🔑 Configured {len(app_config.client_authentication.allowed_keys)} client keys")
-    
+
     MODEL_TO_SERVICE_MAPPING, ALIAS_MAPPING = config_loader.get_model_to_service_mapping()
     DEFAULT_SERVICE = config_loader.get_default_service()
     ALLOWED_CLIENT_KEYS = config_loader.get_allowed_client_keys()
+    DYNAMIC_ROUTING_KEYS = config_loader.get_dynamic_routing_keys()
     GLOBAL_TRIGGER_SIGNAL = generate_random_trigger_signal()
-    
+
     logger.info(f"🎯 Configured {len(MODEL_TO_SERVICE_MAPPING)} model mappings")
     if ALIAS_MAPPING:
         logger.info(f"🔄 Configured {len(ALIAS_MAPPING)} model aliases: {list(ALIAS_MAPPING.keys())}")
     logger.info(f"🔄 Default service: {DEFAULT_SERVICE['name']}")
+    if app_config.features.enable_dynamic_routing:
+        logger.info(f"🔀 Dynamic routing enabled with {len(DYNAMIC_ROUTING_KEYS)} path keys")
     
 except Exception as e:
     logger.error(f"❌ Configuration loading failed: {type(e).__name__}")
@@ -1138,6 +1141,38 @@ async def general_exception_handler(request: Request, exc: Exception):
         }
     )
 
+def parse_dynamic_route(path: str) -> Optional[Tuple[str, str, str]]:
+    """
+    解析动态路由格式的 URL 路径
+    格式: /{path_key}/{protocol}/{base_url}/{remaining_path}
+
+    返回: (path_key, base_url, remaining_path) 或 None
+    """
+    # 移除开头的斜杠
+    path = path.lstrip('/')
+
+    # 分割路径，最多分割3次（path_key, protocol, base_url, remaining_path）
+    parts = path.split('/', 3)
+
+    if len(parts) < 4:
+        return None
+
+    path_key, protocol, base_url_part, remaining_path = parts
+
+    # 验证协议
+    if protocol not in ['http', 'https']:
+        return None
+
+    # 构建完整的 base_url
+    base_url = f"{protocol}://{base_url_part}"
+
+    # 确保 remaining_path 以斜杠开头
+    if not remaining_path.startswith('/'):
+        remaining_path = '/' + remaining_path
+
+    return (path_key, base_url, remaining_path)
+
+
 async def verify_api_key(authorization: str = Header(...)):
     """Dependency: verify client API key"""
     client_key = authorization.replace("Bearer ", "")
@@ -2024,11 +2059,418 @@ async def list_models(_api_key: str = Depends(verify_api_key)):
             "root": model_id,
             "parent": None
         })
-    
+
     return {
         "object": "list",
         "data": models
     }
+
+
+@app.api_route("/{path_key}/{protocol}/{base_url:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def dynamic_routing_handler(
+    request: Request,
+    path_key: str,
+    protocol: str,
+    base_url: str
+):
+    """
+    动态路由处理器
+    格式: /{path_key}/{protocol}/{base_url}/{remaining_path}
+
+    对于 /chat/completions 路径，会应用完整的中间件功能（函数调用注入、工具调用解析等）
+    对于其他路径，仅作为简单的 HTTP 代理
+    """
+    # 检查是否启用动态路由功能
+    if not app_config.features.enable_dynamic_routing:
+        raise HTTPException(status_code=404, detail="Not Found")
+
+    # 解析完整路径
+    full_path = request.url.path
+    parsed = parse_dynamic_route(full_path)
+
+    if parsed is None:
+        raise HTTPException(status_code=400, detail="Invalid dynamic routing format")
+
+    parsed_path_key, base_url, remaining_path = parsed
+
+    # 验证路径密钥（使用独立的动态路由密钥集合）
+    if parsed_path_key not in DYNAMIC_ROUTING_KEYS:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid path key")
+
+    # 获取客户端提供的 Authorization header
+    authorization = request.headers.get("Authorization", "")
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing Authorization header")
+
+    # 构建上游请求 URL
+    upstream_url = f"{base_url}{remaining_path}"
+
+    logger.info(f"🔀 Dynamic routing: {request.method} {upstream_url}")
+    logger.debug(f"🔀 Path key validated: {parsed_path_key[:8]}...")
+
+    # 检查是否是 chat/completions 路径，如果是则应用完整的中间件功能
+    if remaining_path.endswith("/chat/completions") and request.method == "POST":
+        return await handle_dynamic_chat_completions(request, base_url, remaining_path, authorization)
+
+    # 其他路径使用简单代理模式
+    return await handle_dynamic_simple_proxy(request, upstream_url, authorization)
+
+
+async def handle_dynamic_chat_completions(
+    request: Request,
+    base_url: str,
+    remaining_path: str,
+    authorization: str
+):
+    """
+    处理动态路由的 chat/completions 请求，应用完整的中间件功能
+    """
+    try:
+        # 解析请求体
+        body_dict = await request.json()
+        body = ChatCompletionRequest(**body_dict)
+
+        logger.debug(f"🔧 Received dynamic routing chat completion request, model: {body.model}")
+        logger.debug(f"🔧 Number of messages: {len(body.messages)}")
+        logger.debug(f"🔧 Number of tools: {len(body.tools) if body.tools else 0}")
+        logger.debug(f"🔧 Streaming: {body.stream}")
+
+        # 构建上游 URL
+        upstream_url = f"{base_url}{remaining_path}"
+
+        # 消息预处理
+        logger.debug(f"🔧 Starting message preprocessing, original message count: {len(body.messages)}")
+        processed_messages = preprocess_messages(body.messages)
+        logger.debug(f"🔧 Preprocessing completed, processed message count: {len(processed_messages)}")
+
+        if not validate_message_structure(processed_messages):
+            logger.error(f"❌ Message structure validation failed, but continuing processing")
+
+        # 构建请求体
+        request_body_dict = body.model_dump(exclude_unset=True)
+        request_body_dict["messages"] = processed_messages
+
+        # 检查是否需要函数调用功能
+        is_fc_enabled = app_config.features.enable_function_calling
+        has_tools_in_request = bool(body.tools)
+        has_function_call = is_fc_enabled and has_tools_in_request
+
+        logger.debug(f"🔧 Request body constructed, message count: {len(processed_messages)}")
+
+    except ValidationError as e:
+        logger.error(f"❌ Request validation failed: {str(e)}")
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "message": "Invalid request format",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request"
+                }
+            }
+        )
+    except Exception as e:
+        logger.error(f"❌ Request preprocessing failed: {str(e)}")
+        logger.error(f"❌ Error type: {type(e).__name__}")
+        return JSONResponse(
+            status_code=422,
+            content={
+                "error": {
+                    "message": "Invalid request format",
+                    "type": "invalid_request_error",
+                    "code": "invalid_request"
+                }
+            }
+        )
+
+    # 注入函数调用提示词
+    if has_function_call:
+        logger.debug(f"🔧 Using global trigger signal for this request: {GLOBAL_TRIGGER_SIGNAL}")
+
+        # body.tools 已经通过 has_function_call 检查，确保不为 None
+        if body.tools:
+            function_prompt, _ = generate_function_prompt(body.tools, GLOBAL_TRIGGER_SIGNAL)
+
+            tool_choice_prompt = safe_process_tool_choice(body.tool_choice, body.tools)
+            if tool_choice_prompt:
+                function_prompt += tool_choice_prompt
+
+            system_message = {"role": "system", "content": function_prompt}
+            request_body_dict["messages"].insert(0, system_message)
+
+        if "tools" in request_body_dict:
+            del request_body_dict["tools"]
+        if "tool_choice" in request_body_dict:
+            del request_body_dict["tool_choice"]
+
+    elif has_tools_in_request and not is_fc_enabled:
+        logger.info(f"🔧 Function calling is disabled by configuration, ignoring 'tools' and 'tool_choice' in request.")
+        if "tools" in request_body_dict:
+            del request_body_dict["tools"]
+        if "tool_choice" in request_body_dict:
+            del request_body_dict["tool_choice"]
+
+    # Token 计数
+    prompt_tokens = token_counter.count_tokens(request_body_dict["messages"], body.model)
+    logger.info(f"📊 Request to {body.model} - Actual input tokens (including all preprocessing & injected prompts): {prompt_tokens}")
+
+    # 构建请求头
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": authorization,
+        "Accept": "application/json" if not body.stream else "text/event-stream"
+    }
+
+    logger.info(f"📝 Forwarding dynamic routing request to: {upstream_url}")
+    logger.info(f"📝 Model: {request_body_dict.get('model', 'unknown')}, Messages: {len(request_body_dict.get('messages', []))}")
+
+    # 处理非流式响应
+    if not body.stream:
+        try:
+            logger.debug(f"🔧 Sending upstream request to: {upstream_url}")
+            logger.debug(f"🔧 has_function_call: {has_function_call}")
+
+            upstream_response = await http_client.post(
+                upstream_url, json=request_body_dict, headers=headers, timeout=app_config.server.timeout
+            )
+            upstream_response.raise_for_status()
+
+            response_json = upstream_response.json()
+            logger.debug(f"🔧 Upstream response status code: {upstream_response.status_code}")
+
+            # 处理响应和工具调用解析
+            completion_text = ""
+            if response_json.get("choices") and len(response_json["choices"]) > 0:
+                message = response_json["choices"][0].get("message", {})
+                completion_text = message.get("content", "")
+
+                # 如果启用了函数调用，尝试解析工具调用
+                if has_function_call and completion_text:
+                    logger.debug(f"🔧 Complete response content: {repr(completion_text)}")
+
+                    parsed_tools = await attempt_fc_parse_with_retry(
+                        content=completion_text,
+                        trigger_signal=GLOBAL_TRIGGER_SIGNAL,
+                        messages=request_body_dict["messages"],
+                        upstream_url=upstream_url,
+                        headers=headers,
+                        model=body.model,
+                        timeout=app_config.server.timeout
+                    )
+                    logger.debug(f"🔧 XML parsing result: {parsed_tools}")
+
+                    if parsed_tools:
+                        logger.debug(f"🔧 Successfully parsed {len(parsed_tools)} tool calls")
+
+                        tool_calls = []
+                        for tool in parsed_tools:
+                            tool_call_id = f"call_{uuid.uuid4().hex}"
+                            tool_calls.append({
+                                "id": tool_call_id,
+                                "type": "function",
+                                "function": {
+                                    "name": tool["name"],
+                                    "arguments": json.dumps(tool["args"], ensure_ascii=False)
+                                }
+                            })
+                        logger.debug(f"🔧 Converted tool_calls: {tool_calls}")
+
+                        # 提取触发信号之前的文本作为 content
+                        prefix_pos = find_last_trigger_signal_outside_think(completion_text, GLOBAL_TRIGGER_SIGNAL)
+                        prefix_text = None
+                        if prefix_pos != -1:
+                            prefix_text = completion_text[:prefix_pos].rstrip()
+                            if prefix_text == "":
+                                prefix_text = None
+
+                        # 保留上游消息中的额外字段
+                        original_message = response_json["choices"][0]["message"]
+                        new_message = {
+                            "role": "assistant",
+                            "content": prefix_text,
+                            "tool_calls": tool_calls,
+                        }
+                        # 复制上游返回的任何额外字段
+                        for key in original_message:
+                            if key not in ["role", "content", "tool_calls"]:
+                                new_message[key] = original_message[key]
+                        response_json["choices"][0]["message"] = new_message
+                        response_json["choices"][0]["finish_reason"] = "tool_calls"
+                        logger.debug(f"🔧 Function call conversion completed")
+                    else:
+                        logger.debug(f"🔧 No tool calls detected, returning original content")
+
+            # Token 统计
+            completion_tokens = token_counter.count_tokens([{"role": "assistant", "content": completion_text}], body.model)
+
+            if "usage" not in response_json:
+                response_json["usage"] = {}
+            response_json["usage"]["prompt_tokens"] = prompt_tokens
+            response_json["usage"]["completion_tokens"] = completion_tokens
+            response_json["usage"]["total_tokens"] = prompt_tokens + completion_tokens
+
+            logger.info(f"📊 Response tokens - Prompt: {prompt_tokens}, Completion: {completion_tokens}, Total: {prompt_tokens + completion_tokens}")
+
+            return JSONResponse(content=response_json)
+
+        except httpx.TimeoutException:
+            logger.error(f"❌ Dynamic routing timeout: {upstream_url}")
+            raise HTTPException(status_code=504, detail="Gateway Timeout")
+        except httpx.HTTPStatusError as e:
+            logger.error(f"❌ Dynamic routing HTTP error: {e.response.status_code}")
+            try:
+                error_body = e.response.json()
+                return JSONResponse(status_code=e.response.status_code, content=error_body)
+            except:
+                raise HTTPException(status_code=e.response.status_code, detail=str(e))
+        except Exception as e:
+            logger.error(f"❌ Dynamic routing error: {str(e)}")
+            logger.error(f"❌ Error traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail="Internal Server Error")
+
+    # 处理流式响应
+    else:
+        async def stream_generator():
+            try:
+                logger.debug(f"🔧 Starting streaming request to: {upstream_url}")
+
+                # 使用标准的流式代理函数
+                async for chunk in stream_proxy_with_fc_transform(
+                    upstream_url,
+                    request_body_dict,
+                    headers,
+                    body.model,
+                    has_function_call,
+                    GLOBAL_TRIGGER_SIGNAL,
+                    request_body_dict["messages"]
+                ):
+                    yield chunk
+
+            except httpx.TimeoutException:
+                logger.error(f"❌ Dynamic routing streaming timeout")
+                error_chunk = {
+                    "error": {
+                        "message": "Gateway Timeout",
+                        "type": "timeout_error",
+                        "code": "timeout"
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+            except Exception as e:
+                logger.error(f"❌ Dynamic routing streaming error: {str(e)}")
+                logger.error(f"❌ Error traceback: {traceback.format_exc()}")
+                error_chunk = {
+                    "error": {
+                        "message": str(e),
+                        "type": "internal_error",
+                        "code": "internal_error"
+                    }
+                }
+                yield f"data: {json.dumps(error_chunk)}\n\n".encode('utf-8')
+
+        return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+
+async def handle_dynamic_simple_proxy(
+    request: Request,
+    upstream_url: str,
+    authorization: str  # 注意：authorization 已通过 request.headers 透传，此参数保留用于未来扩展
+):
+    """
+    处理动态路由的简单代理请求（非 chat/completions 路径）
+    """
+    # 获取查询参数
+    query_params = dict(request.query_params)
+
+    # 读取请求体
+    body = None
+    if request.method in ["POST", "PUT", "PATCH"]:
+        try:
+            body = await request.json()
+        except Exception:
+            body = await request.body()
+
+    # 构建请求头（透传除特定头之外的所有头）
+    headers = {}
+    for key, value in request.headers.items():
+        if key.lower() not in ["host", "content-length", "transfer-encoding"]:
+            headers[key] = value
+
+    try:
+        # 发送请求到上游服务
+        if request.method == "GET":
+            response = await http_client.get(
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                timeout=app_config.server.timeout
+            )
+        elif request.method == "POST":
+            response = await http_client.post(
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                json=body if isinstance(body, dict) else None,
+                content=body if isinstance(body, bytes) else None,
+                timeout=app_config.server.timeout
+            )
+        elif request.method == "PUT":
+            response = await http_client.put(
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                json=body if isinstance(body, dict) else None,
+                content=body if isinstance(body, bytes) else None,
+                timeout=app_config.server.timeout
+            )
+        elif request.method == "DELETE":
+            response = await http_client.delete(
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                timeout=app_config.server.timeout
+            )
+        elif request.method == "PATCH":
+            response = await http_client.patch(
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                json=body if isinstance(body, dict) else None,
+                content=body if isinstance(body, bytes) else None,
+                timeout=app_config.server.timeout
+            )
+        else:
+            # 其他方法（OPTIONS, HEAD 等）
+            response = await http_client.request(
+                request.method,
+                upstream_url,
+                headers=headers,
+                params=query_params,
+                timeout=app_config.server.timeout
+            )
+
+        # 构建响应头
+        response_headers = {}
+        for key, value in response.headers.items():
+            if key.lower() not in ["content-encoding", "content-length", "transfer-encoding", "connection"]:
+                response_headers[key] = value
+
+        # 返回响应
+        return JSONResponse(
+            status_code=response.status_code,
+            content=response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text,
+            headers=response_headers
+        )
+
+    except httpx.TimeoutException:
+        logger.error(f"❌ Dynamic routing timeout: {upstream_url}")
+        raise HTTPException(status_code=504, detail="Gateway Timeout")
+    except httpx.HTTPStatusError as e:
+        logger.error(f"❌ Dynamic routing HTTP error: {e.response.status_code}")
+        raise HTTPException(status_code=e.response.status_code, detail=str(e))
+    except Exception as e:
+        logger.error(f"❌ Dynamic routing error: {str(e)}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 
 def validate_message_structure(messages: List[Dict[str, Any]]) -> bool:
